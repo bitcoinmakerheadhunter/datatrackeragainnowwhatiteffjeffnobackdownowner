@@ -45,15 +45,15 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ValidationError
-from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.validators import URLValidator
 from django.urls import reverse, reverse_lazy, NoReverseMatch
-from django.db.models import F, Q
+from django.db.models import F, Prefetch, Q
 from django.forms.models import modelform_factory, inlineformset_factory
 from django.template import TemplateDoesNotExist
 from django.template.loader import render_to_string
 from django.utils import timezone
 from django.utils.encoding import force_str
+from django.utils.functional import SimpleLazyObject
 from django.views.decorators.cache import cache_page
 from django.views.decorators.csrf import ensure_csrf_cookie, csrf_exempt
 from django.views.generic import RedirectView
@@ -69,7 +69,7 @@ from ietf.doc.storage_utils import (
     store_file,
 )
 from ietf.doc.templatetags.ietf_filters import absurl
-from ietf.group.models import Group
+from ietf.group.models import Group, Role
 from ietf.group.utils import (
     can_manage_session_materials,
     can_manage_some_groups,
@@ -79,6 +79,7 @@ from ietf.person.models import Person, User
 from ietf.ietfauth.utils import role_required, has_role, user_is_person
 from ietf.mailtrigger.utils import gather_address_lists
 from ietf.meeting.models import (
+    Constraint,
     Meeting,
     Session,
     Schedule,
@@ -87,6 +88,7 @@ from ietf.meeting.models import (
     TimeSlot,
     SlideSubmission,
     Attended,
+    ProceedingsMaterial,
 )
 from ietf.blobdb.models import ResolvedMaterial
 from ietf.blobdb.storage import BlobdbStorage, BlobFile
@@ -114,8 +116,8 @@ from ietf.meeting.forms import (
     InterimCancelForm,
     InterimSessionInlineFormSet,
     RequestMinutesForm,
-    UploadAgendaForm,
-    UploadBlueSheetForm,
+    UploadOrEnterAgendaForm,
+    UploadOrEnterBlueSheetForm,
     UploadMinutesForm,
     UploadSlidesForm,
     validate_slides_title,
@@ -207,6 +209,7 @@ from ietf.name.models import (
 from ietf.utils import markdown
 from ietf.utils.decorators import require_api_key
 from ietf.utils.hedgedoc import Note, NoteError
+from ietf.utils.http import is_safe_next_url
 from ietf.utils.meetecho import MeetechoAPIError, SlidesManager
 from ietf.utils.log import assertion, log
 from ietf.utils.mail import send_mail_message, send_mail_text
@@ -1693,8 +1696,9 @@ def edit_schedule_properties(request, num, owner, name):
         form = SchedulePropertiesForm(meeting, instance=Schedule.objects.get(pk=schedule.pk), data=request.POST)
         if form.is_valid():
             form.save()
-            if request.GET.get('next'):
-                return HttpResponseRedirect(request.GET.get('next'))
+            next_url = request.GET.get("next")
+            if is_safe_next_url(next_url, {"ietf.meeting.views.list_schedules"}):
+                return HttpResponseRedirect(next_url)
             return redirect('ietf.meeting.views.edit_meeting_schedule', num=num, owner=owner, name=form.instance.name)
     else:
         form = SchedulePropertiesForm(meeting, instance=schedule)
@@ -1882,13 +1886,10 @@ def agenda_plain(request, num=None, name=None, base=None, ext=None, owner=None, 
         get_assignments_for_agenda(schedule),
         meeting
     )
-    AgendaKeywordTagger(assignments=filtered_assignments).apply()
 
     # Done processing for CSV output
     if ext == ".csv":
         return agenda_csv(schedule, filtered_assignments, utc=utc is not None)
-
-    filter_organizer = AgendaFilterOrganizer(assignments=filtered_assignments)
 
     is_current_meeting = (num is None) or (num == get_current_ietf_meeting_num())
 
@@ -1902,8 +1903,6 @@ def agenda_plain(request, num=None, name=None, base=None, ext=None, owner=None, 
                 "schedule": schedule,
                 "filtered_assignments": filtered_assignments,
                 "updated": updated,
-                "filter_categories": filter_organizer.get_filter_categories(),
-                "non_area_keywords": filter_organizer.get_non_area_keywords(),
                 "now": timezone.now().astimezone(meeting.tz()),
                 "display_timezone": display_timezone,
                 "is_current_meeting": is_current_meeting,
@@ -1957,9 +1956,11 @@ def generate_agenda_data(num=None, force_refresh=False):
         if is_current_meeting
         else settings.AGENDA_CACHE_TIMEOUT_DEFAULT
     )
-    cache_format = "1"  # bump this on backward-incompatible data format changes
+    # bump this to force a cache rebuild
+    # (e.g., on a backward-incompatible data format change)
+    cache_version = "2"
 
-    cache_key = f"generate_agenda_data:{meeting.number}:v{cache_format}"
+    cache_key = f"generate_agenda_data:{meeting.number}:v{cache_version}"
     if not force_refresh:
         cached_value = cache.get(cache_key)
         if cached_value is not None:
@@ -2112,6 +2113,7 @@ def agenda_extract_schedule(item):
             "chatArchive" : item.session.chat_archive_url(),
             "recordings": list(map(agenda_extract_recording, item.session.recordings())),
             "videoStream": item.session.video_stream_url() or "",
+            "sessionRecording": item.session.session_recording_url() or "",
             "audioStream": item.session.audio_stream_url() or "",
             "webex": item.timeslot.location.webex_url() if item.timeslot.location else "",
             "onsiteTool": item.session.onsite_tool_url() or "",
@@ -2377,20 +2379,30 @@ def session_draft_pdf(request, num, acronym):
     return HttpResponse(pdf_contents, content_type="application/pdf")
 
 def ical_session_status(assignment):
-    if assignment.session.current_status == 'canceled':
+    if assignment.session.current_status in ('canceled', 'resched'):
         return "CANCELLED"
-    elif assignment.session.current_status == 'resched':
-        t = "RESCHEDULED"
-        if assignment.session.tombstone_for_id is not None:
-            other_assignment = SchedTimeSessAssignment.objects.filter(schedule=assignment.schedule_id, session=assignment.session.tombstone_for_id).first()
-            if other_assignment:
-                t = "RESCHEDULED TO {}-{}".format(
-                    other_assignment.timeslot.time.strftime("%A %H:%M").upper(),
-                    other_assignment.timeslot.end_time().strftime("%H:%M")
-                )
-        return t
     else:
         return "CONFIRMED"
+
+
+# Marks the vacated slot in the event title
+RESCHEDULED_SUMMARY_PREFIX = "Rescheduled: "
+
+
+def ical_rescheduled_note(assignment):
+    if getattr(assignment.session, "current_status", None) != 'resched':
+        return None
+    note = "Rescheduled"
+    if assignment.session.tombstone_for_id is not None:
+        other_assignment = SchedTimeSessAssignment.objects.filter(schedule=assignment.schedule_id, session=assignment.session.tombstone_for_id).first()
+        if other_assignment:
+            meeting_tz = assignment.schedule.meeting.tz()
+            note = "Rescheduled to {}-{} ({})".format(
+                other_assignment.timeslot.time.astimezone(meeting_tz).strftime("%A %H:%M"),
+                other_assignment.timeslot.end_time().astimezone(meeting_tz).strftime("%H:%M"),
+                assignment.schedule.meeting.time_zone,
+            )
+    return note
 
 
 def render_icalendar_precomp(agenda_data):
@@ -2429,26 +2441,33 @@ def generate_agenda_ical_precomp(agenda_data):
         if item["note"]:
             summary += f" ({item["note"]})"
 
+        if item["status"] == "resched":
+            summary = f"{RESCHEDULED_SUMMARY_PREFIX}{summary}"
+
         event.add("summary", summary)
 
         if item["room"]:
             event.add("location", item["room"])  # room name
 
+        # RFC 5545 allows only TENTATIVE, CONFIRMED or CANCELLED on a VEVENT, so the
+        # vacated slot of a rescheduled session has to be CANCELLED for calendars to drop it
+        rescheduled_note = None
         if item["status"] == "canceled":
             status = "CANCELLED"
         elif item["status"] == "resched":
+            status = "CANCELLED"
             resched_to = item["rescheduledTo"]
-            if resched_to is None:
-                status = "RESCHEDULED"
+            if not resched_to:
+                rescheduled_note = "Rescheduled"
             else:
                 resched_start = datetime.datetime.fromisoformat(
                     resched_to["startDateTime"]
-                )
+                ).astimezone(pytz.timezone(meeting_data["timezone"]))
                 dur = datetime.timedelta(seconds=resched_to["duration"])
                 resched_end = resched_start + dur
-                formatted_start = resched_start.strftime("%A %H:%M").upper()
+                formatted_start = resched_start.strftime("%A %H:%M")
                 formatted_end = resched_end.strftime("%H:%M")
-                status = f"RESCHEDULED TO {formatted_start}-{formatted_end}"
+                rescheduled_note = f"Rescheduled to {formatted_start}-{formatted_end} ({meeting_data["timezone"]})"
         else:
             status = "CONFIRMED"
         event.add("status", status)
@@ -2465,6 +2484,9 @@ def generate_agenda_ical_precomp(agenda_data):
         event.add("dtstamp", datetime.datetime.fromisoformat(item["slotModified"]))
 
         description_parts = [item["slotName"]]
+
+        if rescheduled_note:
+            description_parts.append(rescheduled_note)
 
         if item["note"]:
             description_parts.append(f"Note: {item["note"]}")
@@ -2543,6 +2565,9 @@ def generate_agenda_ical(schedule, assignments):
         if item.session.agenda_note:
             summary += f" ({item.session.agenda_note})"
 
+        if getattr(item.session, "current_status", None) == "resched":
+            summary = f"{RESCHEDULED_SUMMARY_PREFIX}{summary}"
+
         event.add("summary", summary)
 
         if item.timeslot.show_location and item.timeslot.get_location():
@@ -2564,6 +2589,10 @@ def generate_agenda_ical(schedule, assignments):
         event.add("dtstamp", dtstamp)
 
         description_parts = [item.timeslot.name]
+
+        rescheduled_note = ical_rescheduled_note(item)
+        if rescheduled_note:
+            description_parts.append(rescheduled_note)
 
         if item.session.agenda_note:
             description_parts.append(f"Note: {item.session.agenda_note}")
@@ -2968,17 +2997,38 @@ def meeting_requests(request, num=None):
             purpose__in=('admin', 'social'),
         ).with_current_status().with_requested_by().exclude(
             requested_by=0
+        ).select_related(
+            "group__parent__type", "group__state", "group__type", "purpose"
         ).prefetch_related(
-            "group", "group__ad_role__person", "group__type"
+            "joint_with_groups",
+            Prefetch(
+                "group__role_set",
+                queryset=Role.objects.filter(name="ad").select_related("person"),
+                to_attr="ad_roles",
+            ),
         )
     )
 
     status_names = {n.slug: n.name for n in SessionStatusName.objects.all()}
     session_requesters = {p.pk: p for p in Person.objects.filter(pk__in=[s.requested_by for s in sessions if s.requested_by is not None])}
 
+    # Same constraints and order as Session.constraints(), fetched for all sessions at once
+    constraints_by_group = defaultdict(list)
+    for c in Constraint.objects.filter(
+        meeting=meeting,
+        source__in={s.group_id for s in sessions},
+    ).order_by(
+        "name__name", "target__acronym", "person__name"
+    ).select_related(
+        "name", "person", "source__parent", "target__parent"
+    ).prefetch_related("timeranges"):
+        constraints_by_group[c.source_id].append(c)
+
     for s in sessions:
         s.current_status_name = status_names.get(s.current_status, s.current_status)
         s.requested_by_person = session_requesters.get(s.requested_by)
+        s.ad_role = s.group.ad_roles[0] if s.group.ad_roles else None
+        s.constraint_list = constraints_by_group[s.group_id]
         if s.group.parent and s.group.parent.type.slug in ('area', 'irtf'):
             s.display_area = s.group.parent
         else:
@@ -3319,11 +3369,12 @@ def upload_session_bluesheets(request, session_id, num):
         permission_denied(request, 'Restricted to role Secretariat')
         
     _, session_number = sessions_covered_by_apply_to_all(session)
+    bluesheet_sp = session.presentations.filter(document__type='bluesheets').first()
 
     if request.method == 'POST':
-        form = UploadBlueSheetForm(request.POST,request.FILES)
+        form = UploadOrEnterBlueSheetForm(request.POST,request.FILES)
         if form.is_valid():
-            file = request.FILES['file']
+            file = form.get_file()
 
             ota = session.official_timeslotassignment()
             sess_time = ota and ota.timeslot.time
@@ -3342,9 +3393,10 @@ def upload_session_bluesheets(request, session_id, num):
                 messages.success(request, 'Successfully uploaded bluesheets.')
                 return redirect('ietf.meeting.views.session_details',num=num,acronym=session.group.acronym)
     else: 
-        form = UploadBlueSheetForm()
-
-    bluesheet_sp = session.presentations.filter(document__type='bluesheets').first()
+        initial = {'submission_method': 'upload'}
+        if bluesheet_sp and Path(bluesheet_sp.document.uploaded_filename).suffix == '.txt':
+            initial['content'] = bluesheet_sp.document.text()
+        form = UploadOrEnterBlueSheetForm(initial=initial)
 
     return render(request, "meeting/upload_session_bluesheets.html", 
                   {'session': session,
@@ -3372,7 +3424,7 @@ def upload_session_minutes(request, session_id, num):
     if request.method == 'POST':
         form = UploadMinutesForm(choices, select_all, request.POST, request.FILES, shared_with=shared_with)
         if form.is_valid():
-            file = request.FILES['file']
+            file = form.cleaned_data['file']
             _, ext = os.path.splitext(file.name)
 
             # Set up the new revision
@@ -3429,7 +3481,7 @@ def upload_session_narrativeminutes(request, session_id, num):
     if request.method == 'POST':
         form = UploadNarrativeMinutesForm(choices, select_all, request.POST, request.FILES, shared_with=shared_with)
         if form.is_valid():
-            file = request.FILES['file']
+            file = form.cleaned_data['file']
             _, ext = os.path.splitext(file.name)
 
             # Set up the new revision
@@ -3468,51 +3520,6 @@ def upload_session_narrativeminutes(request, session_id, num):
                    'form': form,
                   })
 
-class UploadOrEnterAgendaForm(UploadAgendaForm):
-    ACTIONS = [
-        ("upload", "Upload agenda"),
-        ("enter", "Enter agenda"),
-    ]
-    submission_method = forms.ChoiceField(choices=ACTIONS, widget=forms.RadioSelect)
-
-    content = forms.CharField(widget=forms.Textarea, required=False, strip=False, label="Agenda text")
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.fields["file"].required=False
-        self.order_fields(["scope", "submission_method", "file", "content"])
-
-    def clean_content(self):
-        return self.cleaned_data["content"].replace("\r", "")
-
-    def clean_file(self):
-        submission_method = self.cleaned_data.get("submission_method")
-        if submission_method == "upload":
-            if self.cleaned_data.get("file", None) is not None:
-                return super().clean_file()
-        return None
-
-    def clean(self):
-        def require_field(f):
-            if not self.cleaned_data.get(f):
-                self.add_error(f, ValidationError("You must fill in this field."))
-
-        submission_method = self.cleaned_data.get("submission_method")
-        if submission_method == "upload":
-            require_field("file")
-        elif submission_method == "enter":
-            require_field("content")
-
-    def get_file(self):
-        """Get content as a file-like object"""
-        if self.cleaned_data.get("submission_method") == "upload":
-            return self.cleaned_data["file"]
-        else:
-            return SimpleUploadedFile(
-                name="uploaded.md",
-                content=self.cleaned_data["content"].encode("utf-8"),
-                content_type="text/markdown;charset=utf-8",
-            )
 
 def upload_session_agenda(request, session_id, num):
     # num is redundant, but we're dragging it along an artifact of where we are in the current URL structure
@@ -3554,10 +3561,7 @@ def upload_session_agenda(request, session_id, num):
                 reclaim = doc is not None and name == material_document_name(session, 'agenda', group_wide=False)[0]
             rev = '%02d' % (int(doc.rev)+1) if doc is not None else '00'
             filename = '%s-%s%s' % (name, rev, ext)
-            try:
-                encoding=form.file_encoding[file.name]
-            except AttributeError:
-                encoding=None
+            encoding = form.file_encoding[file.name]
             # Store the file before changing any record, so a rejected upload changes nothing.
             # The way this function builds the filename it will never trigger the file delete in handle_file_upload.
             try:
@@ -4559,14 +4563,275 @@ def interim_request_edit(request, number):
         "form": form,
         "formset": formset})
 
+# Attendance for IETF meetings that predate the registration data used by
+# Meeting.get_attendance() (IETF 110 and later), as published on
+# https://www.ietf.org/meeting/past/ in October 2026. Remote attendance was
+# first reported for IETF 91; earlier entries have no "remote" key.
+LEGACY_PLENARY_ATTENDANCE = {
+    "1": {"onsite": 21},
+    "2": {"onsite": 21},
+    "3": {"onsite": 18},
+    "4": {"onsite": 35},
+    "5": {"onsite": 35},
+    "6": {"onsite": 88},
+    "7": {"onsite": 101},
+    "8": {"onsite": 56},
+    "9": {"onsite": 82},
+    "10": {"onsite": 112},
+    "11": {"onsite": 114},
+    "12": {"onsite": 120},
+    "13": {"onsite": 114},
+    "14": {"onsite": 217},
+    "15": {"onsite": 138},
+    "16": {"onsite": 196},
+    "17": {"onsite": 244},
+    "18": {"onsite": 293},
+    "19": {"onsite": 292},
+    "20": {"onsite": 348},
+    "21": {"onsite": 387},
+    "22": {"onsite": 372},
+    "23": {"onsite": 530},
+    "24": {"onsite": 677},
+    "25": {"onsite": 633},
+    "26": {"onsite": 638},
+    "27": {"onsite": 493},
+    "28": {"onsite": 636},
+    "29": {"onsite": 785},
+    "30": {"onsite": 710},
+    "31": {"onsite": 1079},
+    "32": {"onsite": 983},
+    "33": {"onsite": 617},
+    "34": {"onsite": 1007},
+    "35": {"onsite": 1038},
+    "36": {"onsite": 1283},
+    "37": {"onsite": 1993},
+    "38": {"onsite": 1321},
+    "39": {"onsite": 1308},
+    "40": {"onsite": 1897},
+    "41": {"onsite": 1775},
+    "42": {"onsite": 2106},
+    "43": {"onsite": 2124},
+    "44": {"onsite": 1705},
+    "45": {"onsite": 1710},
+    "46": {"onsite": 2379},
+    "47": {"onsite": 1431},
+    "48": {"onsite": 2344},
+    "49": {"onsite": 2810},
+    "50": {"onsite": 1822},
+    "51": {"onsite": 2226},
+    "52": {"onsite": 1691},
+    "53": {"onsite": 1656},
+    "54": {"onsite": 1885},
+    "55": {"onsite": 1570},
+    "56": {"onsite": 1679},
+    "57": {"onsite": 1304},
+    "58": {"onsite": 1233},
+    "59": {"onsite": 1390},
+    "60": {"onsite": 1460},
+    "61": {"onsite": 1311},
+    "62": {"onsite": 1133},
+    "63": {"onsite": 1450},
+    "64": {"onsite": 1240},
+    "65": {"onsite": 1264},
+    "66": {"onsite": 1257},
+    "67": {"onsite": 1245},
+    "68": {"onsite": 1193},
+    "69": {"onsite": 1175},
+    "70": {"onsite": 1128},
+    "71": {"onsite": 1174},
+    "72": {"onsite": 1181},
+    "73": {"onsite": 962},
+    "74": {"onsite": 1185},
+    "75": {"onsite": 1124},
+    "76": {"onsite": 1152},
+    "77": {"onsite": 1248},
+    "78": {"onsite": 1192},
+    "79": {"onsite": 1207},
+    "80": {"onsite": 1231},
+    "81": {"onsite": 1127},
+    "82": {"onsite": 948},
+    "83": {"onsite": 1395},
+    "84": {"onsite": 1199},
+    "85": {"onsite": 1157},
+    "86": {"onsite": 1115},
+    "87": {"onsite": 1435},
+    "88": {"onsite": 1189},
+    "89": {"onsite": 1400},
+    "90": {"onsite": 1237},
+    "91": {"onsite": 1109, "remote": 361},
+    "92": {"onsite": 1221, "remote": 421},
+    "93": {"onsite": 1387, "remote": 387},
+    "94": {"onsite": 1319, "remote": 358},
+    "95": {"onsite": 1043, "remote": 614},
+    "96": {"onsite": 1423, "remote": 368},
+    "97": {"onsite": 1042, "remote": 367},
+    "98": {"onsite": 1127, "remote": 315},
+    "99": {"onsite": 1230, "remote": 506},
+    "100": {"onsite": 1018, "remote": 468},
+    "101": {"onsite": 1235, "remote": 575},
+    "102": {"onsite": 1078, "remote": 547},
+    "103": {"onsite": 879, "remote": 521},
+    "104": {"onsite": 1213, "remote": 864},
+    "105": {"onsite": 1103, "remote": 861},
+    "106": {"onsite": 1004, "remote": 607},
+    "107": {"onsite": 0, "remote": 701},
+    "108": {"onsite": 0, "remote": 1102},
+    "109": {"onsite": 0, "remote": 1061}
+}
+
+
+# Hosts for IETF meetings that have no MeetingHost records, as named on
+# https://www.ietf.org/meeting/past/ (October 2026). Shown as text, without logos.
+LEGACY_PLENARY_HOSTS = {
+    "1": "Linkabit",
+    "2": "Army Ballistics Research Lab",
+    "3": "University of Michigan",
+    "4": "SRI",
+    "5": "NASA Ames Research Center",
+    "6": "BBN",
+    "7": "MITRE",
+    "8": "NCAR",
+    "9": "San Diego Supercomputer Center",
+    "10": "US Naval Academy",
+    "11": "University of Michigan",
+    "12": "University of Texas",
+    "13": "Kennedy Space Center",
+    "14": "Stanford University",
+    "15": "University of Hawaii",
+    "16": "Florida State University Supercomputer Center",
+    "17": "Pittsburgh Supercomputer Center",
+    "18": "University of British Columbia",
+    "19": "University of Colorado",
+    "20": "Washington University",
+    "21": "BellSouth",
+    "22": "Los Alamos National Laboratory",
+    "23": "San Diego Supercomputer Center",
+    "24": "NEARnet",
+    "25": "US Sprint",
+    "26": "OARnet and The Ohio State University",
+    "27": "Surfnet and RARE",
+    "28": "SESQUINET and Rice University",
+    "29": "NorthWestNet",
+    "30": "University of Toronto",
+    "31": "Sun Microsystems",
+    "32": "FTP Software and NEARnet",
+    "33": "the Royal Institute of Technology and NORDUnet",
+    "34": "MCI",
+    "37": "Cisco Systems",
+    "38": "Federal Express",
+    "39": "ISOC-Germany Chapter",
+    "40": "Newbridge Networks, Inc",
+    "42": "Motorola",
+    "43": "Microsoft Corporation",
+    "44": "Ascend Communications",
+    "45": "Uninett",
+    "46": "Nortel Networks, Inc",
+    "47": "connect.com.au",
+    "48": "Marconi",
+    "49": "Cisco Systems and Qualcomm",
+    "50": "Lucent Technologies",
+    "51": "BTexact Technologies",
+    "52": "Novell",
+    "53": "Cable & Wireless",
+    "54": "Fujitsu and The WIDE Project",
+    "55": "Nokia",
+    "57": "Austria Telekom",
+    "59": "KT (Korea Telcom) and Samsung",
+    "61": "Alcatel",
+    "63": "France Telecom",
+    "64": "Nortel",
+    "65": "Nokia",
+    "66": "Ericsson",
+    "67": "Siemens",
+    "68": "NeuStar",
+    "69": "Motorola",
+    "70": "Cisco Research and Microsoft",
+    "71": "Comcast",
+    "72": "Alcatel-Lucent",
+    "73": "Google",
+    "74": "Juniper",
+    "75": ".SE",
+    "76": "WIDE",
+    "78": "SIDN",
+    "79": "Tsinghua University",
+    "80": "CZ.NIC",
+    "81": "RIM",
+    "82": "TWNIC",
+    "83": "Cisco",
+    "84": "Google",
+    "85": "North American Cable Industry",
+    "86": "Comcast and NBC Universal",
+    "87": "DENIC, EURid, Deutsche Telekom, Dyn and eco",
+    "88": "Huawei",
+    "89": "ICANN",
+    "90": "Ericsson",
+    "91": "Cisco",
+    "92": "Google",
+    "93": "Brocade and CZ.NIC",
+    "94": "WIDE",
+    "95": "LACNIC and the Internet Society",
+    "96": "Juniper Networks"
+}
+
+
+def _past_plenaries(today):
+    """Past IETF meetings with the extra data the past meetings page shows"""
+    plenaries = list(
+        Meeting.objects.filter(type_id='ietf', date__lte=today)
+        .prefetch_related(
+            'meetinghosts',
+            Prefetch(
+                'proceedings_materials',
+                queryset=ProceedingsMaterial.objects.filter(
+                    type_id='meeting_survey',
+                    document__states__type_id='procmaterials',
+                    document__states__slug='active',
+                ).select_related('document'),
+                to_attr='surveys',
+            ),
+        )
+        .order_by('-date')
+    )
+    # remote is None for meetings before remote attendance was reported
+    PastAttendance = namedtuple('PastAttendance', 'onsite remote')
+    for meeting in plenaries:
+        meeting.attendance = meeting.get_attendance()
+        meeting.legacy_host = LEGACY_PLENARY_HOSTS.get(meeting.number)
+        if meeting.attendance is None and meeting.number in LEGACY_PLENARY_ATTENDANCE:
+            legacy = LEGACY_PLENARY_ATTENDANCE[meeting.number]
+            meeting.attendance = PastAttendance(onsite=legacy['onsite'], remote=legacy.get('remote'))
+    return plenaries
+
+
 def past(request):
     '''List of past meetings'''
     today = timezone.now()
 
-    meetings = data_for_meetings_overview(Meeting.objects.filter(date__lte=today).order_by('-date'))
+    # past.html caches its content, so only build this when the template
+    # actually renders it
+    plenaries = SimpleLazyObject(lambda: _past_plenaries(today))
 
     return render(request, 'meeting/past.html', {
-                  'meetings': meetings,
+                  'plenaries': plenaries,
+                  'selected_tab': 'plenary',
+                  })
+
+
+def past_interims(request):
+    '''List of past interim meetings, the second tab of the past meetings pages'''
+    today = timezone.now()
+
+    # past_interims.html caches its content, so only build this when the
+    # template actually renders it
+    interims = SimpleLazyObject(
+        lambda: data_for_meetings_overview(
+            Meeting.objects.filter(type_id='interim', date__lte=today).order_by('-date')
+        )
+    )
+
+    return render(request, 'meeting/past_interims.html', {
+                  'interims': interims,
+                  'selected_tab': 'interim',
                   })
 
 def upcoming(request):

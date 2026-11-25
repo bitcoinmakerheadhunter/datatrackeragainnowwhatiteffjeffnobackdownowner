@@ -19,6 +19,8 @@ from typing import Tuple
 
 from pathlib import Path
 
+from celery.exceptions import SoftTimeLimitExceeded
+
 from django.conf import settings
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import transaction
@@ -44,11 +46,13 @@ from ietf.meeting.factories import MeetingFactory
 from ietf.name.models import DraftSubmissionStateName, FormalLanguageName
 from ietf.person.models import Person
 from ietf.person.factories import UserFactory, PersonFactory, EmailFactory
-from ietf.submit.checkers import DraftIdnits3Checker
+from ietf.submit.checkers import DraftIdnitsChecker, DraftIdnits3Checker
 from ietf.submit.factories import SubmissionFactory, SubmissionExtResourceFactory
 from ietf.submit.forms import SubmissionBaseUploadForm, SubmissionAutoUploadForm
 from ietf.submit.models import Submission, Preapproval, SubmissionExtResource
-from ietf.submit.tasks import cancel_stale_submissions, process_and_accept_uploaded_submission_task
+from ietf.submit.parsers.plain_parser import PlainParser
+from ietf.submit.tasks import (cancel_stale_submissions, process_and_accept_uploaded_submission_task,
+                               process_uploaded_submission_task)
 from ietf.submit.utils import (expirable_submissions, expire_submission, find_submission_filenames,
                                post_submission, validate_submission_name, validate_submission_rev,
                                process_and_accept_uploaded_submission, SubmissionError, process_submission_text,
@@ -396,7 +400,15 @@ class SubmitTests(BaseSubmitTestCase):
         rev = "00"
         group = "mars"
 
-        status_url, author = self.do_submission(name, rev, group, formats)
+        # tests assume these checkers run, override in case config is different
+        with override_settings(
+            IDSUBMIT_CHECKER_CLASSES=[
+                "ietf.submit.checkers.DraftIdnitsChecker",
+                "ietf.submit.checkers.DraftIdnits3Checker",
+                "ietf.submit.checkers.DraftYangChecker",
+            ]
+        ):
+            status_url, author = self.do_submission(name, rev, group, formats)
 
         # supply submitter info, then draft should be in and ready for approval
         mailbox_before = len(outbox)
@@ -1891,7 +1903,11 @@ class SubmitTests(BaseSubmitTestCase):
         name = "draft-yang-testing-invalid"
         rev = "00"
 
-        status_url, _ = self.do_submission(name=name, rev=rev, base_filename="test_submission_invalid_yang")
+        # test assumes this checker runs, override in case config is different
+        with override_settings(
+            IDSUBMIT_CHECKER_CLASSES=["ietf.submit.checkers.DraftYangChecker"]
+        ):
+            status_url, _ = self.do_submission(name=name, rev=rev, base_filename="test_submission_invalid_yang")
         r = self.client.get(status_url)
         q = PyQuery(r.content)
         #
@@ -2568,6 +2584,27 @@ class ApiSubmissionTests(BaseSubmitTestCase):
 
  
 
+class PlainParserTests(TestCase):
+    @override_settings(IDSUBMIT_MAX_DRAFT_SIZE={"txt": 10})
+    def test_oversized_file_is_not_parsed_further(self):
+        f = SimpleUploadedFile("draft-x-00.txt", b"draft-x-00\n" * 10, content_type="text/plain")
+        with mock.patch.object(PlainParser, "parse_name") as parse_name:
+            info = PlainParser(f).critical_parse()
+        self.assertTrue(any("File size is larger" in e for e in info.errors))
+        parse_name.assert_not_called()
+
+
+class DraftIdnitsCheckerTests(TestCase):
+    def passed(self, output):
+        with mock.patch("ietf.submit.checkers.pipe", return_value=(0, output.encode(), b"")):
+            return DraftIdnitsChecker().check_file_txt("draft-x-00.txt")[0]
+
+    def test_passed_follows_summary(self):
+        self.assertTrue(self.passed("\n  No nits found.\n"))
+        self.assertTrue(self.passed("\n  Summary: 0 errors (**), 0 flaws (~~), 1 warning (==), 0 comments (--).\n"))
+        self.assertFalse(self.passed("\n  Summary: 1 error (**), 0 flaws (~~), 0 warnings (==), 0 comments (--).\n"))
+
+
 class SubmissionUploadFormTests(BaseSubmitTestCase):
     def test_check_submission_thresholds(self):
         today = date_today()
@@ -3238,6 +3275,34 @@ class AsyncSubmissionTests(BaseSubmitTestCase):
         self.assertEqual(submission.file_size, text_data["file_size"])
         self.assertEqual(submission.xml_version, xml_data["xml_version"])
 
+    def test_process_uploaded_submission_soft_time_limit(self):
+        """A submission whose validation times out is cancelled, not left validating"""
+        submission = SubmissionFactory(state_id="validating", file_types=".xml,.txt")
+        with mock.patch(
+            "ietf.submit.utils.process_submission_xml", side_effect=SoftTimeLimitExceeded
+        ):
+            process_uploaded_submission(submission)
+        submission = Submission.objects.get(pk=submission.pk)
+        self.assertEqual(submission.state_id, "cancel")
+
+    def test_submission_tasks_have_time_limits(self):
+        """Both submission tasks are bounded, and the bound precedes the stale sweeper"""
+        self.assertLess(
+            settings.IDSUBMIT_TASK_SOFT_TIME_LIMIT, settings.IDSUBMIT_TASK_TIME_LIMIT
+        )
+        self.assertLess(
+            settings.IDSUBMIT_TASK_TIME_LIMIT,
+            settings.IDSUBMIT_MAX_VALIDATION_TIME.total_seconds(),
+        )
+        for task in (
+            process_uploaded_submission_task,
+            process_and_accept_uploaded_submission_task,
+        ):
+            self.assertEqual(task.time_limit, settings.IDSUBMIT_TASK_TIME_LIMIT)
+            self.assertEqual(
+                task.soft_time_limit, settings.IDSUBMIT_TASK_SOFT_TIME_LIMIT
+            )
+
     def test_status_of_validating_submission(self):
         s = SubmissionFactory(state_id='validating')
         url = urlreverse('ietf.submit.views.submission_status', kwargs={'submission_id': s.pk})
@@ -3489,6 +3554,18 @@ class SubmissionStatusTests(BaseSubmitTestCase):
         self.assertContains(r, "and 1 warning.")
         self.assertContains(r, "would then be rejected")
         self.assertContains(r, "idnits3 message")
+        alert = " ".join(PyQuery(r.content)("p.alert-warning").text().split())
+        self.assertIn("so those errors have not stopped it", alert)
+        self.assertIn("please fix them before you submit again", alert)
+
+        # A single error is referred to in the singular
+        check.errors = 1
+        check.save()
+        r = self.client.get(url)
+        alert = " ".join(PyQuery(r.content)("p.alert-warning").text().split())
+        self.assertIn("returned 1 error and 1 warning.", alert)
+        self.assertIn("so that error has not stopped it", alert)
+        self.assertIn("please fix it before you submit again", alert)
 
         # Warnings only - nothing that would block later
         check.errors = 0
@@ -3505,6 +3582,51 @@ class SubmissionStatusTests(BaseSubmitTestCase):
         r = self.client.get(url)
         self.assertNotContains(r, "would then be rejected")
         self.assertNotContains(r, "None of them would stop this submission.")
+
+    def test_advisory_submission_check_comments(self):
+        """Comments from an advisory check are reported as comments, not warnings"""
+        submission = SubmissionFactory(state_id="uploaded")
+        url = urlreverse(
+            "ietf.submit.views.submission_status",
+            kwargs={"submission_id": submission.pk},
+        )
+        check = submission.checks.create(
+            checker="idnits3 check",
+            passed=True,
+            message="idnits3 message",
+            errors=2,
+            warnings=1,
+            items={"advisory": True, "would_block_in_future": True, "comments": 3},
+        )
+
+        def alert_text(r):
+            return " ".join(PyQuery(r.content)("p.alert").text().split())
+
+        def button_classes(r):
+            return PyQuery(r.content)(f'button[data-bs-target="#check-{check.pk}"]').attr("class")
+
+        # Errors, warnings and comments are each counted
+        r = self.client.get(url)
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("returned 2 errors, 1 warning, and 3 comments.", alert_text(r))
+
+        # Warnings and comments
+        check.errors = 0
+        check.items = {"advisory": True, "would_block_in_future": False, "comments": 1}
+        check.save()
+        r = self.client.get(url)
+        self.assertIn("returned 1 warning and 1 comment. None of them", alert_text(r))
+        self.assertIn("btn-warning", button_classes(r))
+
+        # Comments only - an informational note, not a warning
+        check.warnings = 0
+        check.items = {"advisory": True, "would_block_in_future": False, "comments": 2}
+        check.save()
+        r = self.client.get(url)
+        q = PyQuery(r.content)
+        self.assertEqual(len(q("p.alert-info:contains('returned 2 comments.')")), 1)
+        self.assertNotIn("warning", alert_text(r))
+        self.assertIn("btn-success", button_classes(r))
 
 
 class Idnits3CheckerTests(TestCase):
@@ -3584,7 +3706,8 @@ class Idnits3CheckerTests(TestCase):
         # The check must not fail the submission, even though idnits3 found errors
         self.assertTrue(passed)
         self.assertEqual(errors, 1)
-        self.assertEqual(warnings, 2)  # warnings and comments are both reported as warnings
+        self.assertEqual(warnings, 1)
+        self.assertEqual(info["comments"], 1)
         self.assertTrue(info["advisory"])
         self.assertTrue(info["would_block_in_future"])
         self.assertEqual(len(info["items"]), 3)
@@ -3613,7 +3736,34 @@ class Idnits3CheckerTests(TestCase):
         self.assertTrue(passed)
         self.assertEqual(errors, 0)
         self.assertEqual(warnings, 1)
+        self.assertEqual(info["comments"], 0)
         self.assertFalse(info["would_block_in_future"])
+
+    def test_comments_are_not_warnings(self):
+        output = self.idnits3_output(
+            [
+                {
+                    "severity": "ValidationComment",
+                    "code": "SOME_COMMENT",
+                    "desc": "Just a comment.",
+                },
+                {
+                    "severity": "ValidationComment",
+                    "code": "ANOTHER_COMMENT",
+                    "desc": "Another comment.",
+                },
+            ]
+        )
+        with override_settings(IDSUBMIT_IDNITS3_BINARY=self.fake_idnits3(output)):
+            passed, message, errors, warnings, info = DraftIdnits3Checker().check_file_txt(
+                self.draft_path
+            )
+        self.assertTrue(passed)
+        self.assertEqual((errors, warnings), (0, 0))
+        self.assertEqual(info["comments"], 2)
+        self.assertFalse(info["would_block_in_future"])
+        self.assertIn("0 errors, 0 warnings, 2 comments", message)
+        self.assertIn("Comments:", message)
 
     def test_clean_document(self):
         with override_settings(
